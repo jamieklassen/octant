@@ -17,6 +17,10 @@ func Test_FromKubeConfig(t *testing.T) {
 	kubeConfig := filepath.Join("testdata", "kubeconfig.yaml")
 	config := RESTConfigOptions{}
 
-	_, err := FromKubeConfig(context.TODO(), kubeConfig, "", "", []string{}, config)
+	_, err := FromKubeConfig(
+		context.TODO(),
+		WithKubeConfigList(kubeConfig),
+		WithRESTConfigOptions(config),
+	)
 	require.NoError(t, err)
 }

@@ -179,7 +179,14 @@ func (r *Runner) initAPI(ctx context.Context, logger log.Logger, options Options
 		Burst:     options.ClientBurst,
 		UserAgent: options.UserAgent,
 	}
-	clusterClient, err := cluster.FromKubeConfig(ctx, options.KubeConfig, options.Context, options.Namespace, options.Namespaces, restConfigOptions)
+	clusterClient, err := cluster.FromKubeConfig(
+		ctx,
+		cluster.WithKubeConfigList(options.KubeConfig),
+		cluster.WithContextName(options.Context),
+		cluster.WithInitialNamespace(options.Namespace),
+		cluster.WithProvidedNamespaces(options.Namespaces),
+		cluster.WithRESTConfigOptions(restConfigOptions),
+	)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to init cluster client, does your kube config have a current-context set?: %w", err)
 	}

@@ -241,41 +241,85 @@ func (c *Cluster) Version() (string, error) {
 	return fmt.Sprint(serverVersion), nil
 }
 
+type clusterOptions struct {
+	KubeConfigList     string
+	ContextName        string
+	InitialNamespace   string
+	ProvidedNamespaces []string
+	RESTConfigOptions  RESTConfigOptions
+}
+
+type ClusterOption func(*clusterOptions)
+
+func WithKubeConfigList(kubeConfigList string) ClusterOption {
+	return func(clusterOptions *clusterOptions) {
+		clusterOptions.KubeConfigList = kubeConfigList
+	}
+}
+
+func WithContextName(contextName string) ClusterOption {
+	return func(clusterOptions *clusterOptions) {
+		clusterOptions.ContextName = contextName
+	}
+}
+
+func WithInitialNamespace(initialNamespace string) ClusterOption {
+	return func(clusterOptions *clusterOptions) {
+		clusterOptions.InitialNamespace = initialNamespace
+	}
+}
+
+func WithProvidedNamespaces(providedNamespaces []string) ClusterOption {
+	return func(clusterOptions *clusterOptions) {
+		clusterOptions.ProvidedNamespaces = providedNamespaces
+	}
+}
+
+func WithRESTConfigOptions(restConfigOptions RESTConfigOptions) ClusterOption {
+	return func(clusterOptions *clusterOptions) {
+		clusterOptions.RESTConfigOptions = restConfigOptions
+	}
+}
+
 // FromKubeConfig creates a Cluster from a kubeConfig chain.
-func FromKubeConfig(ctx context.Context, kubeConfigList, contextName string, initialNamespace string, providedNamespaces []string, options RESTConfigOptions) (*Cluster, error) {
-	chain := strings.Deduplicate(filepath.SplitList(kubeConfigList))
+func FromKubeConfig(ctx context.Context, opts... ClusterOption) (*Cluster, error) {
+	options := clusterOptions{}
+	for _, opt := range opts {
+		opt(&options)
+	}
+	chain := strings.Deduplicate(filepath.SplitList(options.KubeConfigList))
 	rules := &clientcmd.ClientConfigLoadingRules{
 		Precedence: chain,
 	}
 
 	overrides := &clientcmd.ConfigOverrides{}
-	if contextName != "" {
-		overrides.CurrentContext = contextName
+	if options.ContextName != "" {
+		overrides.CurrentContext = options.ContextName
 	}
-	cc := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(rules, overrides)
-	config, err := cc.ClientConfig()
+	clientConfig := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(rules, overrides)
+	restConfig, err := clientConfig.ClientConfig()
 	if err != nil {
 		return nil, err
 	}
 
 	var defaultNamespace string
 
-	if initialNamespace == "" {
-		defaultNamespace, _, err = cc.Namespace()
+	if options.InitialNamespace == "" {
+		defaultNamespace, _, err = clientConfig.Namespace()
 		if err != nil {
 			return nil, err
 		}
 	} else {
-		defaultNamespace = initialNamespace
+		defaultNamespace = options.InitialNamespace
 	}
 
 	logger := internalLog.From(ctx)
-	logger.With("client-qps", options.QPS, "client-burst", options.Burst).
+	logger.With("client-qps", options.RESTConfigOptions.QPS, "client-burst", options.RESTConfigOptions.Burst).
 		Debugf("initializing REST client configuration")
 
-	config = withConfigDefaults(config, options)
+	restConfig = withConfigDefaults(restConfig, options.RESTConfigOptions)
 
-	return newCluster(ctx, cc, config, defaultNamespace, providedNamespaces)
+	return newCluster(ctx, clientConfig, restConfig, defaultNamespace, options.ProvidedNamespaces)
 }
 
 // withConfigDefaults returns an extended rest.Config object with additional defaults applied
