@@ -64,6 +64,105 @@ type Options struct {
 	Listener               net.Listener
 }
 
+type RunnerOption struct {
+	clusterOption    cluster.ClusterOption
+	nonClusterOption func(*Options)
+}
+
+func WithOpenCensus() RunnerOption {
+	return RunnerOption{
+		nonClusterOption: func(o *Options) {
+			o.EnableOpenCensus = true
+		},
+	}
+}
+
+func WithoutClusterOverview() RunnerOption {
+	return RunnerOption{
+		nonClusterOption: func(o *Options) {
+			o.DisableClusterOverview = true
+		},
+	}
+}
+
+func WithKubeConfig(kubeConfig string) RunnerOption {
+	return RunnerOption{
+		clusterOption: cluster.WithKubeConfigList(kubeConfig),
+		nonClusterOption: func(o *Options) {
+			o.KubeConfig = kubeConfig
+		},
+	}
+}
+
+func WithNamespace(namespace string) RunnerOption {
+	return RunnerOption{
+		clusterOption: cluster.WithInitialNamespace(namespace),
+		nonClusterOption: func(o *Options) {
+			o.Namespace = namespace
+		},
+	}
+}
+
+func WithNamespaces(namespaces []string) RunnerOption {
+	return RunnerOption{
+		clusterOption: cluster.WithProvidedNamespaces(namespaces),
+		nonClusterOption: func(o *Options) {
+			o.Namespaces = namespaces
+		},
+	}
+}
+
+func WithFrontendURL(frontendURL string) RunnerOption {
+	return RunnerOption{
+		nonClusterOption: func(o *Options) {
+			o.FrontendURL = frontendURL
+		},
+	}
+}
+
+func WithBrowserPath(browserPath string) RunnerOption {
+	return RunnerOption{
+		nonClusterOption: func(o *Options) {
+			o.BrowserPath = browserPath
+		},
+	}
+}
+
+func WithContext(context string) RunnerOption {
+	return RunnerOption{
+		clusterOption: cluster.WithContextName(context),
+		nonClusterOption: func(o *Options) {
+			o.Context = context
+		},
+	}
+}
+
+func WithClientQPS(qps float32) RunnerOption {
+	return RunnerOption{
+		clusterOption: cluster.WithClientQPS(qps),
+	}
+}
+
+func WithClientBurst(burst int) RunnerOption {
+	return RunnerOption{
+		clusterOption: cluster.WithClientBurst(burst),
+	}
+}
+
+func WithClientUserAgent(userAgent string) RunnerOption {
+	return RunnerOption{
+		clusterOption: cluster.WithClientUserAgent(userAgent),
+	}
+}
+
+func WithBuildInfo(buildInfo config.BuildInfo) RunnerOption {
+	return RunnerOption{
+		nonClusterOption: func(o *Options) {
+			o.BuildInfo = buildInfo
+		},
+	}
+}
+
 type Runner struct {
 	ctx                    context.Context
 	dash                   *dash
@@ -75,7 +174,14 @@ type Runner struct {
 	fs                     afero.Fs
 }
 
-func NewRunner(ctx context.Context, logger log.Logger, options Options) (*Runner, error) {
+func NewRunner(ctx context.Context, logger log.Logger, opts ...RunnerOption) (*Runner, error) {
+	clusterOptions := []cluster.ClusterOption{}
+	options := Options{}
+	for _, opt := range opts {
+		clusterOptions = append(clusterOptions, opt.clusterOption)
+		opt.nonClusterOption(&options)
+	}
+
 	r := Runner{}
 	ctx = internalLog.WithLoggerContext(ctx, logger)
 	ctx = ocontext.WithKubeConfigCh(ctx)
@@ -101,7 +207,7 @@ func NewRunner(ctx context.Context, logger log.Logger, options Options) (*Runner
 	r.fs = afero.NewOsFs()
 
 	if options.KubeConfig, err = ValidateKubeConfig(logger, options.KubeConfig, r.fs); err == nil {
-		apiService, pluginService, apiErr = r.initAPI(ctx, logger, options)
+		apiService, pluginService, apiErr = r.initAPI(ctx, logger, options, clusterOptions...)
 		if apiErr != nil {
 			return nil, fmt.Errorf("failed to start service api: %w", apiErr)
 		}
@@ -125,7 +231,14 @@ func NewRunner(ctx context.Context, logger log.Logger, options Options) (*Runner
 	return &r, nil
 }
 
-func (r *Runner) Start(options Options, startupCh, shutdownCh chan bool) error {
+func (r *Runner) Start(startupCh, shutdownCh chan bool, runnerOptions... RunnerOption) error {
+	clusterOptions := []cluster.ClusterOption{}
+	options := Options{}
+	for _, opt := range runnerOptions {
+		clusterOptions = append(clusterOptions, opt.clusterOption)
+		opt.nonClusterOption(&options)
+	}
+
 	logger := internalLog.From(r.ctx)
 	go func() {
 		if err := r.dash.Run(r.ctx, startupCh); err != nil {
@@ -171,22 +284,10 @@ func (r *Runner) Start(options Options, startupCh, shutdownCh chan bool) error {
 	return nil
 }
 
-func (r *Runner) initAPI(ctx context.Context, logger log.Logger, options Options) (*api.API, *pluginAPI.GRPCService, error) {
+func (r *Runner) initAPI(ctx context.Context, logger log.Logger, options Options, clusterOptions ...cluster.ClusterOption) (*api.API, *pluginAPI.GRPCService, error) {
 	frontendProxy := pluginAPI.FrontendProxy{}
 
-	restConfigOptions := cluster.RESTConfigOptions{
-		QPS:       options.ClientQPS,
-		Burst:     options.ClientBurst,
-		UserAgent: options.UserAgent,
-	}
-	clusterClient, err := cluster.FromKubeConfig(
-		ctx,
-		cluster.WithKubeConfigList(options.KubeConfig),
-		cluster.WithContextName(options.Context),
-		cluster.WithInitialNamespace(options.Namespace),
-		cluster.WithProvidedNamespaces(options.Namespaces),
-		cluster.WithRESTConfigOptions(restConfigOptions),
-	)
+	clusterClient, err := cluster.FromKubeConfig(ctx, clusterOptions...)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to init cluster client, does your kube config have a current-context set?: %w", err)
 	}

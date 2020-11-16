@@ -275,6 +275,24 @@ func WithProvidedNamespaces(providedNamespaces []string) ClusterOption {
 	}
 }
 
+func WithClientQPS(qps float32) ClusterOption {
+	return func(clusterOptions *clusterOptions) {
+		clusterOptions.RESTConfigOptions.QPS = qps
+	}
+}
+
+func WithClientBurst(burst int) ClusterOption {
+	return func(clusterOptions *clusterOptions) {
+		clusterOptions.RESTConfigOptions.Burst = burst
+	}
+}
+
+func WithClientUserAgent(userAgent string) ClusterOption {
+	return func(clusterOptions *clusterOptions) {
+		clusterOptions.RESTConfigOptions.UserAgent = userAgent
+	}
+}
+
 func WithRESTConfigOptions(restConfigOptions RESTConfigOptions) ClusterOption {
 	return func(clusterOptions *clusterOptions) {
 		clusterOptions.RESTConfigOptions = restConfigOptions
