@@ -139,19 +139,22 @@ func WithContext(context string) RunnerOption {
 
 func WithClientQPS(qps float32) RunnerOption {
 	return RunnerOption{
-		clusterOption: cluster.WithClientQPS(qps),
+		clusterOption:    cluster.WithClientQPS(qps),
+		nonClusterOption: func(o *Options) {},
 	}
 }
 
 func WithClientBurst(burst int) RunnerOption {
 	return RunnerOption{
-		clusterOption: cluster.WithClientBurst(burst),
+		clusterOption:    cluster.WithClientBurst(burst),
+		nonClusterOption: func(o *Options) {},
 	}
 }
 
 func WithClientUserAgent(userAgent string) RunnerOption {
 	return RunnerOption{
-		clusterOption: cluster.WithClientUserAgent(userAgent),
+		clusterOption:    cluster.WithClientUserAgent(userAgent),
+		nonClusterOption: func(o *Options) {},
 	}
 }
 
@@ -159,6 +162,14 @@ func WithBuildInfo(buildInfo config.BuildInfo) RunnerOption {
 	return RunnerOption{
 		nonClusterOption: func(o *Options) {
 			o.BuildInfo = buildInfo
+		},
+	}
+}
+
+func WithListener(listener net.Listener) RunnerOption {
+	return RunnerOption{
+		nonClusterOption: func(o *Options) {
+			o.Listener = listener
 		},
 	}
 }
@@ -175,10 +186,8 @@ type Runner struct {
 }
 
 func NewRunner(ctx context.Context, logger log.Logger, opts ...RunnerOption) (*Runner, error) {
-	clusterOptions := []cluster.ClusterOption{}
 	options := Options{}
 	for _, opt := range opts {
-		clusterOptions = append(clusterOptions, opt.clusterOption)
 		opt.nonClusterOption(&options)
 	}
 
@@ -206,8 +215,10 @@ func NewRunner(ctx context.Context, logger log.Logger, opts ...RunnerOption) (*R
 
 	r.fs = afero.NewOsFs()
 
-	if options.KubeConfig, err = ValidateKubeConfig(logger, options.KubeConfig, r.fs); err == nil {
-		apiService, pluginService, apiErr = r.initAPI(ctx, logger, options, clusterOptions...)
+	validKubeConfig, err := ValidateKubeConfig(logger, options.KubeConfig, r.fs)
+	if err == nil {
+		opts = append(opts, WithKubeConfig(validKubeConfig))
+		apiService, pluginService, apiErr = r.initAPI(ctx, logger, opts...)
 		if apiErr != nil {
 			return nil, fmt.Errorf("failed to start service api: %w", apiErr)
 		}
@@ -231,11 +242,9 @@ func NewRunner(ctx context.Context, logger log.Logger, opts ...RunnerOption) (*R
 	return &r, nil
 }
 
-func (r *Runner) Start(startupCh, shutdownCh chan bool, runnerOptions... RunnerOption) error {
-	clusterOptions := []cluster.ClusterOption{}
+func (r *Runner) Start(startupCh, shutdownCh chan bool, opts ...RunnerOption) error {
 	options := Options{}
-	for _, opt := range runnerOptions {
-		clusterOptions = append(clusterOptions, opt.clusterOption)
+	for _, opt := range opts {
 		opt.nonClusterOption(&options)
 	}
 
@@ -249,12 +258,13 @@ func (r *Runner) Start(startupCh, shutdownCh chan bool, runnerOptions... RunnerO
 	if !r.apiCreated {
 		logger.Infof("waiting for kube config ...")
 		options.KubeConfig = <-ocontext.KubeConfigChFrom(r.ctx)
+		opts = append(opts, WithKubeConfig(options.KubeConfig))
 
 		if options.KubeConfig == "" {
 			return errors.New("unexpected empty kube config")
 		}
 		logger.Debugf("Loading configuration: %v", options.KubeConfig)
-		apiService, pluginService, err := r.initAPI(r.ctx, logger, options)
+		apiService, pluginService, err := r.initAPI(r.ctx, logger, opts...)
 		if err != nil {
 			logger.Errorf("cannot create api: %v", err)
 		}
@@ -284,7 +294,13 @@ func (r *Runner) Start(startupCh, shutdownCh chan bool, runnerOptions... RunnerO
 	return nil
 }
 
-func (r *Runner) initAPI(ctx context.Context, logger log.Logger, options Options, clusterOptions ...cluster.ClusterOption) (*api.API, *pluginAPI.GRPCService, error) {
+func (r *Runner) initAPI(ctx context.Context, logger log.Logger, opts ...RunnerOption) (*api.API, *pluginAPI.GRPCService, error) {
+	clusterOptions := []cluster.ClusterOption{}
+	options := Options{}
+	for _, opt := range opts {
+		clusterOptions = append(clusterOptions, opt.clusterOption)
+		opt.nonClusterOption(&options)
+	}
 	frontendProxy := pluginAPI.FrontendProxy{}
 
 	clusterClient, err := cluster.FromKubeConfig(ctx, clusterOptions...)
@@ -371,6 +387,11 @@ func (r *Runner) initAPI(ctx context.Context, logger log.Logger, options Options
 		Time:    options.BuildInfo.Time,
 	}
 
+	restConfigOptions := cluster.RESTConfigOptions{
+		QPS:       options.ClientQPS,
+		Burst:     options.ClientBurst,
+		UserAgent: options.UserAgent,
+	}
 	dashConfig := config.NewLiveConfig(
 		clusterClient,
 		crdWatcher,

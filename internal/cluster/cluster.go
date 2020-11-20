@@ -300,10 +300,12 @@ func WithRESTConfigOptions(restConfigOptions RESTConfigOptions) ClusterOption {
 }
 
 // FromKubeConfig creates a Cluster from a kubeConfig chain.
-func FromKubeConfig(ctx context.Context, opts... ClusterOption) (*Cluster, error) {
+func FromKubeConfig(ctx context.Context, opts ...ClusterOption) (*Cluster, error) {
 	options := clusterOptions{}
 	for _, opt := range opts {
-		opt(&options)
+		if opt != nil {
+			opt(&options)
+		}
 	}
 	chain := strings.Deduplicate(filepath.SplitList(options.KubeConfigList))
 	rules := &clientcmd.ClientConfigLoadingRules{

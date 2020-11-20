@@ -27,10 +27,10 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/vmware-tanzu/octant/internal/log"
+	internalLog "github.com/vmware-tanzu/octant/internal/log"
 	"github.com/vmware-tanzu/octant/pkg/event"
 
-	pkglog "github.com/vmware-tanzu/octant/pkg/log"
+	"github.com/vmware-tanzu/octant/pkg/log"
 )
 
 func TestRunner_ValidateKubeconfig(t *testing.T) {
@@ -86,7 +86,7 @@ func TestRunner_ValidateKubeconfig(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			logger := log.NopLogger()
+			logger := internalLog.NopLogger()
 			path, err := ValidateKubeConfig(logger, test.fileList, fs)
 			if test.isErr {
 				require.Error(t, err)
@@ -147,23 +147,23 @@ func TestNewRunnerLoadsValidKubeConfigFilteringNonexistent(t *testing.T) {
 	stubRiceBox("dist/dash-frontend")
 	kubeConfig := tempFile(makeKubeConfig("test-context", srv.URL))
 	defer os.Remove(kubeConfig.Name())
-
 	listener := NewInMemoryListener()
-	cancel, _ := makeRunner(
-		Options{
-			KubeConfig: strings.Join(
-				[]string{
-					"/non/existent/kubeconfig",
-					kubeConfig.Name(),
-				},
-				string(filepath.ListSeparator),
-			),
-			Listener: listener,
-		},
-		log.NopLogger(),
+
+	cancel, err := makeRunner(
+		internalLog.NopLogger(),
+		WithKubeConfig(strings.Join(
+			[]string{
+				"/non/existent/kubeconfig",
+				kubeConfig.Name(),
+			},
+			string(filepath.ListSeparator),
+		)),
+		WithListener(listener),
 	)
+	require.NoError(t, err)
 	defer cancel()
-	kubeConfigEvent := waitForKubeConfigEvent(listener)
+	kubeConfigEvent, err := waitForKubeConfigEvent(listener)
+	require.NoError(t, err)
 
 	require.Equal(t, "test-context", kubeConfigEvent.Data.CurrentContext)
 }
@@ -174,7 +174,8 @@ func TestNewRunnerRunsLoadingAPIWhenStartedWithoutKubeConfig(t *testing.T) {
 	stubRiceBox("dist/dash-frontend")
 
 	listener := NewInMemoryListener()
-	cancel, _ := makeRunner(Options{Listener: listener}, log.NopLogger())
+	cancel, err := makeRunner(internalLog.NopLogger(), WithListener(listener))
+	require.NoError(t, err)
 	defer cancel()
 	kubeConfig := makeKubeConfig("test-context", srv.URL)
 	websocketWrite(
@@ -190,7 +191,8 @@ func TestNewRunnerRunsLoadingAPIWhenStartedWithoutKubeConfig(t *testing.T) {
 			break
 		}
 	}
-	kubeConfigEvent := waitForKubeConfigEvent(listener)
+	kubeConfigEvent, err := waitForKubeConfigEvent(listener)
+	require.NoError(t, err)
 
 	require.Equal(t, "test-context", kubeConfigEvent.Data.CurrentContext)
 }
@@ -244,7 +246,7 @@ current-context: %s
 `, currentContext, serverAddr, currentContext))
 }
 
-func waitForKubeConfigEvent(listener *inMemoryListener) kubeConfigEvent {
+func waitForKubeConfigEvent(listener *inMemoryListener) (kubeConfigEvent, error) {
 	var message kubeConfigEvent
 	dialer := websocket.DefaultDialer
 	dialer.NetDial = listener.Dial
@@ -255,13 +257,19 @@ func waitForKubeConfigEvent(listener *inMemoryListener) kubeConfigEvent {
 	}
 	defer wsConn.Close()
 	for {
-		msgBytes, _ := readNextMessage(wsConn)
-		json.Unmarshal(msgBytes, &message)
+		msgBytes, err := readNextMessage(wsConn)
+		if err != nil {
+			return message, err
+		}
+		err = json.Unmarshal(msgBytes, &message)
+		if err != nil {
+			return message, err
+		}
 		if message.Type == event.EventTypeKubeConfig {
 			break
 		}
 	}
-	return message
+	return message, nil
 }
 
 type kubeConfigEvent struct {
@@ -278,13 +286,13 @@ func tempFile(contents []byte) *os.File {
 	return tmpFile
 }
 
-func makeRunner(options Options, logger pkglog.Logger) (context.CancelFunc, error) {
+func makeRunner(logger log.Logger, opts ...RunnerOption) (context.CancelFunc, error) {
 	ctx, cancel := context.WithCancel(context.Background())
-	runner, err := NewRunner(ctx, logger, options)
+	runner, err := NewRunner(ctx, logger, opts...)
 	if err != nil {
 		return cancel, err
 	}
-	go runner.Start(options, make(chan bool), make(chan bool))
+	go runner.Start(make(chan bool), make(chan bool), opts...)
 	return cancel, nil
 }
 
