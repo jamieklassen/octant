@@ -18,6 +18,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 
@@ -109,7 +110,13 @@ func TestNewRunnerLoadsValidKubeConfigFilteringNonexistent(t *testing.T) {
 
 	uri, cancel, _ := makeRunner(
 		Options{
-			KubeConfig: "/non/existent/kubeconfig:" + kubeConfig.Name(),
+			KubeConfig: strings.Join(
+				[]string{
+					"/non/existent/kubeconfig",
+					kubeConfig.Name(),
+				},
+				string(filepath.ListSeparator),
+			),
 		},
 		log.NopLogger(),
 	)
