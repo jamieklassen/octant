@@ -19,17 +19,20 @@ import (
 	"path/filepath"
 	"runtime"
 	"testing"
+	"time"
 
 	"github.com/gorilla/websocket"
 	"github.com/spf13/afero"
 	"github.com/spf13/viper"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
 	"github.com/vmware-tanzu/octant/internal/api"
 	ocontext "github.com/vmware-tanzu/octant/internal/context"
+	"github.com/vmware-tanzu/octant/internal/log"
 	"github.com/vmware-tanzu/octant/pkg/event"
 
-	"github.com/vmware-tanzu/octant/internal/log"
+	pkglog "github.com/vmware-tanzu/octant/pkg/log"
 )
 
 func TestRunner_ValidateKubeconfig(t *testing.T) {
@@ -97,28 +100,21 @@ func TestRunner_ValidateKubeconfig(t *testing.T) {
 	}
 }
 
-func TestNewRunnerLoadsValidKubeConfig(t *testing.T) {
+func TestNewRunnerLoadsValidKubeConfigFilteringNonexistent(t *testing.T) {
 	srv := fakeK8sAPIThatForbidsWatchingCRDs()
 	defer srv.Close()
-	kubeConfig := tempFile(fmt.Sprintf(`contexts:
-- context: {cluster: cluster}
-  name: test-context
-clusters:
-- cluster: {server: %s}
-  name: cluster
-current-context: test-context
-`, srv.URL))
-	defer os.Remove(kubeConfig.Name())
 	stubRiceBox("dist/dash-frontend")
+	kubeConfig := tempFile(makeKubeConfig("test-context", srv.URL))
+	defer os.Remove(kubeConfig.Name())
 
-	addr := newListenerAddr()
-	cancel, _ := makeRunner(Options{
-		KubeConfig: kubeConfig.Name(),
-	})
-	defer cancel()
-	kubeConfigEvent := waitForKubeConfigEvent(
-		fmt.Sprintf("ws://%s/api/v1/stream", addr),
+	uri, cancel, _ := makeRunner(
+		Options{
+			KubeConfig: "/non/existent/kubeconfig:" + kubeConfig.Name(),
+		},
+		log.NopLogger(),
 	)
+	defer cancel()
+	kubeConfigEvent := waitForKubeConfigEvent(uri)
 
 	require.Equal(t, "test-context", kubeConfigEvent.Data.CurrentContext)
 }
@@ -128,28 +124,70 @@ func TestNewRunnerRunsLoadingAPIWhenStartedWithoutKubeConfig(t *testing.T) {
 	defer srv.Close()
 	stubRiceBox("dist/dash-frontend")
 
-	addr := newListenerAddr()
-	cancel, _ := makeRunner(Options{})
+	uri, cancel, _ := makeRunner(Options{}, log.NopLogger())
 	defer cancel()
-	conn, _, _ := websocket.DefaultDialer.Dial(
-		fmt.Sprintf("ws://%s/api/v1/stream", addr),
-		nil,
+	kubeConfig := makeKubeConfig("test-context", srv.URL)
+	websocketWrite(
+		fmt.Sprintf(`{
+	"type": "action.octant.dev/uploadKubeConfig",
+	"payload": {"kubeConfig": "%s"}
+}`, base64.StdEncoding.EncodeToString(kubeConfig)),
+		uri,
 	)
-	w, _ := conn.NextWriter(websocket.TextMessage)
-	kubeConfig := fmt.Sprintf(`contexts:
+	// wait for API to reload
+	for {
+		if websocketReadTimeout(uri, 10*time.Millisecond) {
+			break
+		}
+	}
+	kubeConfigEvent := waitForKubeConfigEvent(uri)
+
+	require.Equal(t, "test-context", kubeConfigEvent.Data.CurrentContext)
+}
+
+func websocketWrite(message, uri string) error {
+	conn, _, err := websocket.DefaultDialer.Dial(uri, nil)
+	if err != nil {
+		return err
+	}
+	w, err := conn.NextWriter(websocket.TextMessage)
+	if err != nil {
+		return err
+	}
+	_, err = w.Write([]byte(message))
+	if err != nil {
+		return err
+	}
+	w.Close()
+	conn.Close()
+	return nil
+}
+
+func websocketReadTimeout(uri string, timeout time.Duration) bool {
+	conn, _, _ := websocket.DefaultDialer.Dial(uri, nil)
+	defer conn.Close()
+	reader := make(chan interface{}, 1)
+	go func() {
+		conn.NextReader()
+		reader <- nil
+	}()
+	select {
+	case <-reader:
+		return true
+	case <-time.After(timeout):
+		return false
+	}
+}
+
+func makeKubeConfig(currentContext, serverAddr string) []byte {
+	return []byte(fmt.Sprintf(`contexts:
 - context: {cluster: cluster}
-  name: test-context
+  name: %s
 clusters:
 - cluster: {server: %s}
   name: cluster
-current-context: test-context
-`, srv.URL)
-	encoded := base64.StdEncoding.EncodeToString([]byte(kubeConfig))
-	w.Write([]byte(fmt.Sprintf(`{
-	"type": "action.octant.dev/uploadKubeConfig",
-	"payload": {"kubeConfig": "%s"}
-}`, encoded)))
-	w.Close()
+current-context: %s
+`, currentContext, serverAddr, currentContext))
 }
 
 // has side effect of changing global OCTANT_LISTENER_ADDR viper config
@@ -164,6 +202,7 @@ func newListenerAddr() string {
 func waitForKubeConfigEvent(uri string) kubeConfigEvent {
 	var message kubeConfigEvent
 	conn, _, _ := websocket.DefaultDialer.Dial(uri, nil)
+	defer conn.Close()
 	for {
 		msgBytes, _ := readNextMessage(conn)
 		json.Unmarshal(msgBytes, &message)
@@ -181,23 +220,23 @@ type kubeConfigEvent struct {
 	} `json:"data"`
 }
 
-func tempFile(contents string) *os.File {
+func tempFile(contents []byte) *os.File {
 	tmpFile, _ := ioutil.TempFile("", "")
-	tmpFile.Write([]byte(contents))
+	tmpFile.Write(contents)
 	tmpFile.Close()
 	return tmpFile
 }
 
-func makeRunner(options Options) (context.CancelFunc, error) {
+func makeRunner(options Options, logger pkglog.Logger) (string, context.CancelFunc, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	ctx = ocontext.WithKubeConfigCh(ctx)
-	logger := log.NopLogger()
+	addr := newListenerAddr()
 	runner, err := NewRunner(ctx, logger, options)
 	if err != nil {
-		return cancel, err
+		return addr, cancel, err
 	}
 	go runner.Start(ctx, logger, options, make(chan bool), make(chan bool))
-	return cancel, nil
+	return fmt.Sprintf("ws://%s/api/v1/stream", addr), cancel, nil
 }
 
 func fakeK8sAPIThatForbidsWatchingCRDs() *httptest.Server {
@@ -207,8 +246,8 @@ func fakeK8sAPIThatForbidsWatchingCRDs() *httptest.Server {
 			switch r.URL.Path {
 			case "/api":
 				w.Write([]byte(fmt.Sprintf(`{
-	"kind":"APIVersions",
-	"versions":["v1"],
+	"kind": "APIVersions",
+	"versions": ["v1"],
 	"serverAddressByClientCIDRs": [
 		{
 			"clientCIDR": "0.0.0.0/0",
