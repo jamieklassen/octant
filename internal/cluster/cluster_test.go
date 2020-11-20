@@ -13,11 +13,11 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func Test_FromKubeConfig(t *testing.T) {
+func Test_CreateClusterClient(t *testing.T) {
 	kubeConfig := filepath.Join("testdata", "kubeconfig.yaml")
 	config := RESTConfigOptions{}
 
-	_, err := FromKubeConfig(
+	_, err := CreateClusterClient(
 		context.TODO(),
 		WithKubeConfigList(kubeConfig),
 		WithRESTConfigOptions(config),

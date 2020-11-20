@@ -247,6 +247,7 @@ type clusterOptions struct {
 	InitialNamespace   string
 	ProvidedNamespaces []string
 	RESTConfigOptions  RESTConfigOptions
+	client             ClientInterface
 }
 
 type ClusterOption func(*clusterOptions)
@@ -299,13 +300,22 @@ func WithRESTConfigOptions(restConfigOptions RESTConfigOptions) ClusterOption {
 	}
 }
 
-// FromKubeConfig creates a Cluster from a kubeConfig chain.
-func FromKubeConfig(ctx context.Context, opts ...ClusterOption) (*Cluster, error) {
+func WithClient(client ClientInterface) ClusterOption {
+	return func(clusterOptions *clusterOptions) {
+		clusterOptions.client = client
+	}
+}
+
+// CreateClusterClient creates a Cluster from a kubeConfig chain.
+func CreateClusterClient(ctx context.Context, opts ...ClusterOption) (ClientInterface, error) {
 	options := clusterOptions{}
 	for _, opt := range opts {
 		if opt != nil {
 			opt(&options)
 		}
+	}
+	if options.client != nil {
+		return options.client, nil
 	}
 	chain := strings.Deduplicate(filepath.SplitList(options.KubeConfigList))
 	rules := &clientcmd.ClientConfigLoadingRules{

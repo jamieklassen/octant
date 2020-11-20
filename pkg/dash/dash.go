@@ -174,6 +174,13 @@ func WithListener(listener net.Listener) RunnerOption {
 	}
 }
 
+func WithClusterClient(clusterClient cluster.ClientInterface) RunnerOption {
+	return RunnerOption{
+		clusterOption:    cluster.WithClient(clusterClient),
+		nonClusterOption: func(o *Options) {},
+	}
+}
+
 type Runner struct {
 	ctx                    context.Context
 	dash                   *dash
@@ -303,7 +310,7 @@ func (r *Runner) initAPI(ctx context.Context, logger log.Logger, opts ...RunnerO
 	}
 	frontendProxy := pluginAPI.FrontendProxy{}
 
-	clusterClient, err := cluster.FromKubeConfig(ctx, clusterOptions...)
+	clusterClient, err := cluster.CreateClusterClient(ctx, clusterOptions...)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to init cluster client, does your kube config have a current-context set?: %w", err)
 	}
@@ -460,7 +467,7 @@ func initPortForwarder(ctx context.Context, client cluster.ClientInterface, appO
 }
 
 type moduleOptions struct {
-	clusterClient  *cluster.Cluster
+	clusterClient  cluster.ClientInterface
 	crdWatcher     config.CRDWatcher
 	namespace      string
 	logger         log.Logger
