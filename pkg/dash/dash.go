@@ -62,6 +62,7 @@ type Options struct {
 	UserAgent              string
 	BuildInfo              config.BuildInfo
 	Listener               net.Listener
+	clusterClient          cluster.ClientInterface
 }
 
 type RunnerOption struct {
@@ -174,6 +175,14 @@ func WithListener(listener net.Listener) RunnerOption {
 	}
 }
 
+func WithClusterClient(client cluster.ClientInterface) RunnerOption {
+	return RunnerOption{
+		nonClusterOption: func(o *Options) {
+			o.clusterClient = client
+		},
+	}
+}
+
 type Runner struct {
 	ctx                    context.Context
 	dash                   *dash
@@ -215,17 +224,13 @@ func NewRunner(ctx context.Context, logger log.Logger, opts ...RunnerOption) (*R
 
 	r.fs = afero.NewOsFs()
 
-	validKubeConfig, err := ValidateKubeConfig(logger, options.KubeConfig, r.fs)
-	if err == nil {
-		opts = append(opts, WithKubeConfig(validKubeConfig))
+	if options.clusterClient != nil {
 		apiService, pluginService, apiErr = r.initAPI(ctx, logger, opts...)
-		if apiErr != nil {
-			return nil, fmt.Errorf("failed to start service api: %w", apiErr)
-		}
 	} else {
-		logger.Infof("no valid kube config found, initializing loading API")
-		// Initialize the API
-		apiService = api.NewLoadingAPI(ctx, api.PathPrefix, r.actionManager, r.websocketClientManager, logger)
+		apiService, pluginService, apiErr = r.apiFromKubeConfig(options.KubeConfig, opts...)
+	}
+	if apiErr != nil {
+		return nil, fmt.Errorf("failed to start service api: %w", apiErr)
 	}
 
 	d, err := newDash(options.Listener, options.Namespace, options.FrontendURL, options.BrowserPath, apiService, pluginService, logger)
@@ -240,6 +245,18 @@ func NewRunner(ctx context.Context, logger log.Logger, opts ...RunnerOption) (*R
 	r.dash = d
 
 	return &r, nil
+}
+
+func (r *Runner) apiFromKubeConfig(kubeConfig string, opts ...RunnerOption) (api.Service, *pluginAPI.GRPCService, error) {
+	logger := internalLog.From(r.ctx)
+	validKubeConfig, err := ValidateKubeConfig(logger, kubeConfig, r.fs)
+	if err == nil {
+		opts = append(opts, WithKubeConfig(validKubeConfig))
+		return r.initAPI(r.ctx, logger, opts...)
+	} else {
+		logger.Infof("no valid kube config found, initializing loading API")
+		return api.NewLoadingAPI(r.ctx, api.PathPrefix, r.actionManager, r.websocketClientManager, logger), nil, nil
+	}
 }
 
 func (r *Runner) Start(startupCh, shutdownCh chan bool, opts ...RunnerOption) error {
@@ -303,9 +320,13 @@ func (r *Runner) initAPI(ctx context.Context, logger log.Logger, opts ...RunnerO
 	}
 	frontendProxy := pluginAPI.FrontendProxy{}
 
-	clusterClient, err := cluster.FromKubeConfig(ctx, clusterOptions...)
-	if err != nil {
-		return nil, nil, fmt.Errorf("failed to init cluster client, does your kube config have a current-context set?: %w", err)
+	clusterClient := options.clusterClient
+	if clusterClient == nil {
+		var err error
+		clusterClient, err = cluster.FromKubeConfig(ctx, clusterOptions...)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to init cluster client, does your kube config have a current-context set?: %w", err)
+		}
 	}
 
 	if options.EnableOpenCensus {
@@ -460,7 +481,7 @@ func initPortForwarder(ctx context.Context, client cluster.ClientInterface, appO
 }
 
 type moduleOptions struct {
-	clusterClient  *cluster.Cluster
+	clusterClient  cluster.ClientInterface
 	crdWatcher     config.CRDWatcher
 	namespace      string
 	logger         log.Logger
