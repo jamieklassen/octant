@@ -24,11 +24,9 @@ import (
 
 	"github.com/gorilla/websocket"
 	"github.com/spf13/afero"
-	"github.com/spf13/viper"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/vmware-tanzu/octant/internal/api"
 	ocontext "github.com/vmware-tanzu/octant/internal/context"
 	"github.com/vmware-tanzu/octant/internal/log"
 	"github.com/vmware-tanzu/octant/pkg/event"
@@ -101,6 +99,49 @@ func TestRunner_ValidateKubeconfig(t *testing.T) {
 	}
 }
 
+type inMemoryListener struct {
+	conns chan net.Conn
+}
+
+func NewInMemoryListener() *inMemoryListener {
+	return &inMemoryListener{conns: make(chan net.Conn)}
+}
+
+func (iml *inMemoryListener) Accept() (net.Conn, error) {
+	return <-iml.conns, nil
+}
+func (iml *inMemoryListener) Close() error {
+	return nil
+}
+func (iml *inMemoryListener) Dial(network, addr string) (net.Conn, error) {
+	server, client := net.Pipe()
+	iml.conns <- AddrOverriddingConn{server}
+	return AddrOverriddingConn{client}, nil
+}
+func (iml *inMemoryListener) Addr() net.Addr {
+	return localhostAddr{}
+}
+
+type AddrOverriddingConn struct {
+	net.Conn
+}
+
+func (AddrOverriddingConn) LocalAddr() net.Addr {
+	return localhostAddr{}
+}
+func (AddrOverriddingConn) RemoteAddr() net.Addr {
+	return localhostAddr{}
+}
+
+type localhostAddr struct{}
+
+func (localhostAddr) Network() string {
+	return "tcp"
+}
+func (localhostAddr) String() string {
+	return "127.0.0.1:7777"
+}
+
 func TestNewRunnerLoadsValidKubeConfigFilteringNonexistent(t *testing.T) {
 	srv := fakeK8sAPIThatForbidsWatchingCRDs()
 	defer srv.Close()
@@ -108,7 +149,8 @@ func TestNewRunnerLoadsValidKubeConfigFilteringNonexistent(t *testing.T) {
 	kubeConfig := tempFile(makeKubeConfig("test-context", srv.URL))
 	defer os.Remove(kubeConfig.Name())
 
-	uri, cancel, _ := makeRunner(
+	listener := NewInMemoryListener()
+	cancel, _ := makeRunner(
 		Options{
 			KubeConfig: strings.Join(
 				[]string{
@@ -117,11 +159,12 @@ func TestNewRunnerLoadsValidKubeConfigFilteringNonexistent(t *testing.T) {
 				},
 				string(filepath.ListSeparator),
 			),
+			Listener: listener,
 		},
 		log.NopLogger(),
 	)
 	defer cancel()
-	kubeConfigEvent := waitForKubeConfigEvent(uri)
+	kubeConfigEvent := waitForKubeConfigEvent(listener)
 
 	require.Equal(t, "test-context", kubeConfigEvent.Data.CurrentContext)
 }
@@ -131,7 +174,8 @@ func TestNewRunnerRunsLoadingAPIWhenStartedWithoutKubeConfig(t *testing.T) {
 	defer srv.Close()
 	stubRiceBox("dist/dash-frontend")
 
-	uri, cancel, _ := makeRunner(Options{}, log.NopLogger())
+	listener := NewInMemoryListener()
+	cancel, _ := makeRunner(Options{Listener: listener}, log.NopLogger())
 	defer cancel()
 	kubeConfig := makeKubeConfig("test-context", srv.URL)
 	websocketWrite(
@@ -139,25 +183,27 @@ func TestNewRunnerRunsLoadingAPIWhenStartedWithoutKubeConfig(t *testing.T) {
 	"type": "action.octant.dev/uploadKubeConfig",
 	"payload": {"kubeConfig": "%s"}
 }`, base64.StdEncoding.EncodeToString(kubeConfig)),
-		uri,
+		listener,
 	)
 	// wait for API to reload
 	for {
-		if websocketReadTimeout(uri, 10*time.Millisecond) {
+		if websocketReadTimeout(listener, 10*time.Millisecond) {
 			break
 		}
 	}
-	kubeConfigEvent := waitForKubeConfigEvent(uri)
+	kubeConfigEvent := waitForKubeConfigEvent(listener)
 
 	require.Equal(t, "test-context", kubeConfigEvent.Data.CurrentContext)
 }
 
-func websocketWrite(message, uri string) error {
-	conn, _, err := websocket.DefaultDialer.Dial(uri, nil)
+func websocketWrite(message string, listener *inMemoryListener) error {
+	dialer := websocket.DefaultDialer
+	dialer.NetDial = listener.Dial
+	wsConn, _, err := dialer.Dial("ws://127.0.0.1:7777/api/v1/stream", nil)
 	if err != nil {
 		return err
 	}
-	w, err := conn.NextWriter(websocket.TextMessage)
+	w, err := wsConn.NextWriter(websocket.TextMessage)
 	if err != nil {
 		return err
 	}
@@ -166,16 +212,18 @@ func websocketWrite(message, uri string) error {
 		return err
 	}
 	w.Close()
-	conn.Close()
+	wsConn.Close()
 	return nil
 }
 
-func websocketReadTimeout(uri string, timeout time.Duration) bool {
-	conn, _, _ := websocket.DefaultDialer.Dial(uri, nil)
-	defer conn.Close()
+func websocketReadTimeout(listener *inMemoryListener, timeout time.Duration) bool {
+	dialer := websocket.DefaultDialer
+	dialer.NetDial = listener.Dial
+	wsConn, _, _ := dialer.Dial("ws://127.0.0.1:7777/api/v1/stream", nil)
+	defer wsConn.Close()
 	reader := make(chan interface{}, 1)
 	go func() {
-		conn.NextReader()
+		wsConn.NextReader()
 		reader <- nil
 	}()
 	select {
@@ -197,21 +245,18 @@ current-context: %s
 `, currentContext, serverAddr, currentContext))
 }
 
-// has side effect of changing global OCTANT_LISTENER_ADDR viper config
-func newListenerAddr() string {
-	l, _ := net.Listen("tcp", "127.0.0.1:0")
-	addr := l.Addr().String()
-	l.Close()
-	viper.Set(api.ListenerAddrKey, addr)
-	return addr
-}
-
-func waitForKubeConfigEvent(uri string) kubeConfigEvent {
+func waitForKubeConfigEvent(listener *inMemoryListener) kubeConfigEvent {
 	var message kubeConfigEvent
-	conn, _, _ := websocket.DefaultDialer.Dial(uri, nil)
-	defer conn.Close()
+	dialer := websocket.DefaultDialer
+	dialer.NetDial = listener.Dial
+	wsConn, resp, err := dialer.Dial("ws://127.0.0.1:7777/api/v1/stream", nil)
+	if err != nil {
+		fmt.Println(resp)
+		panic(err)
+	}
+	defer wsConn.Close()
 	for {
-		msgBytes, _ := readNextMessage(conn)
+		msgBytes, _ := readNextMessage(wsConn)
 		json.Unmarshal(msgBytes, &message)
 		if message.Type == event.EventTypeKubeConfig {
 			break
@@ -234,16 +279,15 @@ func tempFile(contents []byte) *os.File {
 	return tmpFile
 }
 
-func makeRunner(options Options, logger pkglog.Logger) (string, context.CancelFunc, error) {
+func makeRunner(options Options, logger pkglog.Logger) (context.CancelFunc, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	ctx = ocontext.WithKubeConfigCh(ctx)
-	addr := newListenerAddr()
 	runner, err := NewRunner(ctx, logger, options)
 	if err != nil {
-		return addr, cancel, err
+		return cancel, err
 	}
 	go runner.Start(ctx, logger, options, make(chan bool), make(chan bool))
-	return fmt.Sprintf("ws://%s/api/v1/stream", addr), cancel, nil
+	return cancel, nil
 }
 
 func fakeK8sAPIThatForbidsWatchingCRDs() *httptest.Server {

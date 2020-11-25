@@ -61,6 +61,7 @@ type Options struct {
 	ClientBurst            int
 	UserAgent              string
 	BuildInfo              config.BuildInfo
+	Listener               net.Listener
 }
 
 type Runner struct {
@@ -89,11 +90,7 @@ func NewRunner(ctx context.Context, logger log.Logger, options Options) (*Runner
 	r.websocketClientManager = websocketClientManager
 	go websocketClientManager.Run(ctx)
 
-	listener, err := buildListener()
-	if err != nil {
-		err = fmt.Errorf("failed to create net listener: %w", err)
-		return nil, fmt.Errorf("use OCTANT_LISTENER_ADDR to set host:port: %w", err)
-	}
+	var err error
 
 	var pluginService *pluginAPI.GRPCService
 	var apiService api.Service
@@ -112,7 +109,7 @@ func NewRunner(ctx context.Context, logger log.Logger, options Options) (*Runner
 		apiService = api.NewLoadingAPI(ctx, api.PathPrefix, r.actionManager, r.websocketClientManager, logger)
 	}
 
-	d, err := newDash(listener, options.Namespace, options.FrontendURL, options.BrowserPath, apiService, pluginService, logger)
+	d, err := newDash(options.Listener, options.Namespace, options.FrontendURL, options.BrowserPath, apiService, pluginService, logger)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create dash instance: %w", err)
 	}
@@ -410,16 +407,6 @@ func initModuleManager(options *moduleOptions) (*module.Manager, error) {
 	}
 
 	return moduleManager, nil
-}
-
-func buildListener() (net.Listener, error) {
-	listenerAddr := api.ListenerAddr()
-	conn, err := net.DialTimeout("tcp", listenerAddr, time.Millisecond*500)
-	if err != nil {
-		return net.Listen("tcp", listenerAddr)
-	}
-	_ = conn.Close()
-	return nil, fmt.Errorf("tcp %s: dial: already in use", listenerAddr)
 }
 
 type dash struct {
